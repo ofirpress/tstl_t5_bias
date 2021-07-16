@@ -738,6 +738,68 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         if self.output_projection is None:
             self.build_output_projection(args, dictionary, embed_tokens)
 
+        self.relative_attention_bias = nn.Embedding(32, args.decoder_attention_heads)
+
+    @staticmethod
+    def _relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128):
+        """
+        Adapted from Mesh Tensorflow:
+        https://github.com/tensorflow/mesh/blob/0cb87fe07da627bf0b7e60475d59f95ed6b5be3d/mesh_tensorflow/transformer/transformer_layers.py#L593
+
+        Translate relative position to a bucket number for relative attention. The relative position is defined as
+        memory_position - query_position, i.e. the distance in tokens from the attending position to the attended-to
+        position. If bidirectional=False, then positive relative positions are invalid. We use smaller buckets for
+        small absolute relative_position and larger buckets for larger absolute relative_positions. All relative
+        positions >=max_distance map to the same bucket. All relative positions <=-max_distance map to the same bucket.
+        This should allow for more graceful generalization to longer sequences than the model has been trained on
+
+        Args:
+            relative_position: an int32 Tensor
+            bidirectional: a boolean - whether the attention is bidirectional
+            num_buckets: an integer
+            max_distance: an integer
+
+        Returns:
+            a Tensor with the same shape as relative_position, containing int32 values in the range [0, num_buckets)
+        """
+        ret = 0
+        n = -relative_position
+        if bidirectional:
+            num_buckets //= 2
+            ret += (n < 0).to(torch.long) * num_buckets  # mtf.to_int32(mtf.less(n, 0)) * num_buckets
+            n = torch.abs(n)
+        else:
+            n = torch.max(n, torch.zeros_like(n))
+        # now n is in the range [0, inf)
+
+        # half of the buckets are for exact increments in positions
+        max_exact = num_buckets // 2
+        is_small = n < max_exact
+
+        # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
+        val_if_large = max_exact + (
+            torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
+        ).to(torch.long)
+        val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
+
+        ret += torch.where(is_small, n, val_if_large)
+        return ret
+
+    
+    def compute_bias(self, qlen, klen):
+        """ Compute binned relative position bias """
+        context_position = torch.arange(qlen, dtype=torch.long)[:, None]
+        memory_position = torch.arange(klen, dtype=torch.long)[None, :]
+        relative_position = memory_position - context_position  # shape (qlen, klen)
+        rp_bucket = self._relative_position_bucket(
+            relative_position,  # shape (qlen, klen)
+            bidirectional=False,
+        )
+        rp_bucket = rp_bucket.to(self.relative_attention_bias.weight.device)
+        values = self.relative_attention_bias(rp_bucket)  # shape (qlen, klen, num_heads)
+        values = values.permute([2, 0, 1])  # shape (1, num_heads, qlen, klen)
+        return values
+
     def build_output_projection(self, args, dictionary, embed_tokens):
         if args.adaptive_softmax_cutoff is not None:
             self.adaptive_softmax = AdaptiveSoftmax(
@@ -922,6 +984,15 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
         x = self.dropout_module(x)
 
+        if incremental_state is None and not full_context_alignment:
+            self_attn_mask = self.buffered_future_mask(x)
+            position_bias = self.compute_bias(self.args.tokens_per_sample, self.args.tokens_per_sample)
+            position_bias = position_bias.repeat(x.shape[0] , 1,1)
+            
+            self_attn_mask = self_attn_mask.unsqueeze(0) + position_bias
+        else:
+            self_attn_mask = None
+
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
@@ -933,11 +1004,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         attn: Optional[Tensor] = None
         inner_states: List[Optional[Tensor]] = [x]
         for idx, layer in enumerate(self.layers):
-            if incremental_state is None and not full_context_alignment:
-                self_attn_mask = self.buffered_future_mask(x)
-            else:
-                self_attn_mask = None
-
             x, layer_attn, _ = layer(
                 x,
                 enc,
@@ -985,7 +1051,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         return min(self.max_target_positions, self.embed_positions.max_positions)
 
     def buffered_future_mask(self, tensor):
-        dim = tensor.size(0)
+        dim = tensor.size(1)
         # self._future_mask.device != tensor.device is not working in TorchScript. This is a workaround.
         if (
             self._future_mask.size(0) == 0
@@ -997,7 +1063,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             )
         self._future_mask = self._future_mask.to(tensor)
         return self._future_mask[:dim, :dim]
-
+    
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
         if isinstance(self.embed_positions, SinusoidalPositionalEmbedding):

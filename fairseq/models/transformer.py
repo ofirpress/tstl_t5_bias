@@ -989,7 +989,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             position_bias = self.compute_bias(self.args.tokens_per_sample, self.args.tokens_per_sample)
             position_bias = position_bias.repeat(x.shape[0] , 1,1)
             
-            self_attn_mask = self_attn_mask.unsqueeze(0) + position_bias
+            self_attn_mask = self_attn_mask.unsqueeze(0) + position_bias[:, :x.shape[1], :x.shape[1]]
         else:
             self_attn_mask = None
 
